@@ -7,6 +7,16 @@
 
 static int mpi_rank;
 
+#define CHECK_CUDA(call)                                              \
+  do {                                                                \
+    cudaError_t status_ = call;                                       \
+    if (status_ != cudaSuccess) {                                     \
+      fprintf(stderr, "CUDA error (%s:%d): %s:%s\n", __FILE__, __LINE__, \
+              cudaGetErrorName(status_), cudaGetErrorString(status_));                           \
+      exit(EXIT_FAILURE);                                             \
+    }                                                                 \
+  } while (0)
+
 // Multi-dimensional matrix containing fp32 elements
 struct Tensor {
   Tensor(std::vector<int> shape_);
@@ -16,27 +26,52 @@ struct Tensor {
   void fill_zeros();
 
   float *buf = nullptr;
+  float *gbuf = nullptr;
   int ndim = 0;
   int shape[4];
+
+  void toCPU();
+  void toGPU();
 };
 
 Tensor::Tensor(std::vector<int> shape_) {
+  // reshape
   ndim = shape_.size();
   for (int i = 0; i < ndim; ++i) { shape[i] = shape_[i]; }
   int N_ = num_elem();
-  buf = (float *) calloc(N_, sizeof(float));
+  //reshape fin
+
+  // buf = (float *) calloc(N_, sizeof(float));
+  CHECK_CUDA(cudaMallocHost(&buf, N_ * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&gbuf, N_ * sizeof(float)));
 }
 
 Tensor::Tensor(std::vector<int> shape_, float *buf_) {
+  // reshape
   ndim = shape_.size();
   for (int i = 0; i < ndim; ++i) { shape[i] = shape_[i]; }
   int N_ = num_elem();
-  buf = (float *) calloc(N_, sizeof(float));
-  for (int n = 0; n < N_; ++n) { buf[n] = buf_[n]; }
+  // reshape fin
+
+  // buf = (float *) calloc(N_, sizeof(float));
+  CHECK_CUDA(cudaMallocHost(&buf, N_ * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&gbuf, N_ * sizeof(float)));
+  memcpy(buf, buf_, N_ * sizeof(float)); // for (int n = 0; n < N_; ++n) { buf[n] = buf_[n]; }
+  CHECK_CUDA(cudaMemcpy(gbuf, buf_, N_ * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+void Tensor::toCPU(){
+  CHECK_CUDA(cudaMemcpy(buf, gbuf, num_elem() * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
+void Tensor::toGPU(){
+  CHECK_CUDA(cudaMemcpy(gbuf, buf, num_elem() * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 Tensor::~Tensor() {
-  if (buf != nullptr) free(buf);
+  // if (buf != nullptr) free(buf);
+  cudaFreeHost(buf);
+  CHECK_CUDA(cudaFree(gbuf));
 }
 
 int Tensor::num_elem() {
@@ -87,6 +122,9 @@ void classifier(float *input_, float *output_, int N) {
       // Load one input sentence from input
       Tensor *one_input = new Tensor({1, VOCAB_SIZE, MAX_LENGTH}, input_ + n * VOCAB_SIZE * MAX_LENGTH);
 
+      // yelim!!
+      CHECK_CUDA(cudaMemcpy(one_input->gbuf, input_ + n * VOCAB_SIZE * MAX_LENGTH, VOCAB_SIZE * MAX_LENGTH * sizeof(float), cudaMemcpyHostToDevice));
+      
       // Conv block 1 : Conv1d + LayerNorm + ReLU + MaxPool1d
       conv1d(one_input, w_conv1, b_conv1, a_conv1, 1, 0, 1, true);
       layernorm(a_conv1, gamma_conv1, beta_conv1, a_layernorm1);
@@ -140,13 +178,43 @@ void classifier(float *input_, float *output_, int N) {
       }
 
       output_[n] = max_idx;
+
+      // yelim
+      Tensor *one_output = new Tensor({1}, output_ + n);
+
+      CHECK_CUDA(cudaMemcpy(output_ + n, one_output->gbuf, sizeof(float), cudaMemcpyDeviceToHost));
+      CHECK_CUDA(cudaDeviceSynchronize());
     }  // end N input sentences loop
   }    // if mpi_rank == 0
+}
+
+__global__ void conv1d_kernel(float *in, float *out, float *w, float *b, int out_channels, int in_channels, int kernel_size, int input_length, int output_length, bool has_bias){
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+  int oc = (tidx / output_length) % out_channels;
+  int ol = tidx % output_length;
+
+  if(oc >= out_channels || ol >= output_length) return;  
+
+  float val = 0.0f;
+  int offset = ol;
+  for (int ic = 0; ic < in_channels; ++ic) {
+    for (int ks = 0; ks < kernel_size; ++ks) {
+      val += w[oc * in_channels * kernel_size + ic * kernel_size + ks] *
+                 in[ic * input_length + ks + offset];
+    }
+  }
+  if (has_bias) val += b[oc];
+  out[oc * output_length + ol] = val;  
 }
 
 void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             int stride = 1, int padding = 0, int dilation = 1,
             bool has_bias = true) {
+  float *in = input->gbuf;
+  float *out = output->gbuf;
+  float *w = weight->gbuf;
+  float *b = bias->gbuf;
+
   int out_channels = weight->shape[0];
   int in_channels = weight->shape[1];
   int kernel_size = weight->shape[2];
@@ -154,46 +222,64 @@ void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   int output_length =
       (input->shape[2] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
 
-  for (int oc = 0; oc < out_channels; ++oc) {
-    for (int ol = 0; ol < output_length; ++ol) {
-      float val = 0.0f;
-      int offset = ol;
-      for (int ic = 0; ic < in_channels; ++ic) {
-        for (int ks = 0; ks < kernel_size; ++ks) {
-          val += weight->buf[oc * in_channels * kernel_size + ic * kernel_size + ks] *
-                 input->buf[ic * input_length + ks + offset];
-        }
-      }
-      if (has_bias) val += bias->buf[oc];
-      output->buf[oc * output_length + ol] = val;
-    }
-  }
+  int total_threads = out_channels * output_length;
+  int block_size = 1024; 
+  dim3 blockDim(block_size);
+  dim3 gridDim((total_threads + block_size - 1) / block_size);
+  conv1d_kernel<<<gridDim, blockDim>>>(in, out, w, b, out_channels, in_channels, kernel_size, input_length, output_length, has_bias);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+__global__ void relu_kernel(float *in, float *out, int N){
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+  if(tidx >= N) return;
+  out[tidx] = fmaxf(in[tidx], 0);
 }
 
 void relu(Tensor *input, Tensor *output) {
-  for (int i = 0; i < input->num_elem(); ++i) {
-    if (input->buf[i] > 0.0f)
-      output->buf[i] = input->buf[i];
-    else
-      output->buf[i] = 0.0f;
+  float *in = input->gbuf;
+  float *out = output->gbuf;
+  int N = input->num_elem();
+
+  int total_threads = N;
+  int block_size = 512;
+  dim3 blockDim(block_size);
+  dim3 gridDim((total_threads + block_size - 1) / block_size);
+  relu_kernel<<<gridDim, blockDim>>>(in, out, N);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+__global__ void maxpool1d_kernel(float *in, float *out, int IL, int OC, int OL, int kernel_size, int stride){
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+  int oc = (tidx / OL) * OC;
+  int ol = tidx % OL;
+  if(oc >= OC || ol >= OL) return;
+
+  float mx = -1e99;
+  for (int ks = 0; ks < kernel_size; ++ks) {
+    float val = in[oc * IL + ks + ol * stride];
+    if (val > mx) mx = val;
   }
+  out[oc * OL + ol] = mx;
 }
 
 void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride) {
+  float *in = input->gbuf;
+  float *out = output->gbuf;
+
   int IL = input->shape[2];
   int OC = output->shape[1];
   int OL = output->shape[2];
 
-  for (int oc = 0; oc < OC; ++oc) {
-    for (int ol = 0; ol < OL; ++ol) {
-      float mx = -1e99;
-      for (int ks = 0; ks < kernel_size; ++ks) {
-        float val = input->buf[oc * IL + ks + ol * stride];
-        if (val > mx) mx = val;
-      }
-      output->buf[oc * OL + ol] = mx;
-    }
-  }
+  int total_threads = OC * OL;
+  int block_size = 512;
+  dim3 blockDim(block_size);
+  dim3 gridDim((total_threads + block_size - 1) / block_size);
+  maxpool1d_kernel<<<gridDim, blockDim>>>(in, out, IL, OC, OL, kernel_size, stride);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 void collapse(Tensor *input, Tensor *output) {
@@ -202,19 +288,37 @@ void collapse(Tensor *input, Tensor *output) {
   }
 }
 
+__global__ void linear_kernel(float *in, float *out, float *w, float *b, int IC, int OC, bool has_bias){
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+  int oc = tidx / OC;
+
+  if(oc >= OC) return;
+
+  float val = 0.0;
+  for (int ic = 0; ic < IC; ++ic) {
+    val += in[ic] * w[oc * IC + ic];
+  }
+  if (has_bias) val += b[oc];
+  out[oc] = val;
+}
+
 void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             bool has_bias) {
+  float *in = input->gbuf;
+  float *out = output->gbuf;
+  float *w = weight->gbuf;
+  float *b = bias->gbuf;
+
   int IC = input->shape[1];
   int OC = output->shape[1];
 
-  for (int oc = 0; oc < OC; ++oc) {
-    float val = 0.0;
-    for (int ic = 0; ic < IC; ++ic) {
-      val += input->buf[ic] * weight->buf[oc * IC + ic];
-    }
-    if (has_bias) val += bias->buf[oc];
-    output->buf[oc] = val;
-  }
+  int total_threads = OC;
+  int block_size = 512;
+  dim3 blockDim(block_size);
+  dim3 gridDim((total_threads + block_size - 1) / block_size);
+  linear_kernel<<<gridDim, blockDim>>>(in, out, w, b, IC, OC, has_bias);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output) {
