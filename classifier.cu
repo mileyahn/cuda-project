@@ -19,6 +19,8 @@
 
 #define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
 #define BATCH 4
+#define TSIZE 4
+
 // Multi-dimensional matrix containing fp32 elements
 struct Tensor {
   Tensor(std::vector<int> shape_);
@@ -112,6 +114,8 @@ void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 void relu(Tensor *input, Tensor *output);
 void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride);
 void collapse(Tensor *input, Tensor *output);
+void matmul(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
+            bool has_bias);
 void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             bool has_bias);
 void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output);
@@ -200,11 +204,11 @@ void classifier(float *input_, float *output_, int N) {
       collapse(a_pool6, a_collapse);
       
       // FC block 1 : Linear + ReLU
-      linear(a_collapse, w_fc1, b_fc1, a_linear1, true);
+      matmul(a_collapse, w_fc1, b_fc1, a_linear1, true);
       relu(a_linear1, a_relu7);
 
       // FC block 2 : Linear + ReLU
-      linear(a_relu7, w_fc2, b_fc2, a_linear2, true);
+      matmul(a_relu7, w_fc2, b_fc2, a_linear2, true);
       relu(a_linear2, a_relu8);
 
       // FC block 3 : Linear
@@ -325,6 +329,51 @@ void collapse(Tensor *input, Tensor *output) {
   int N = input->num_elem();
 
   collapse_kernel<<<CEIL_DIV(N, 256), 256>>>(in, out, N);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+__global__ void matmul_kernel(float *A, float *B, float *C, float *bias, int K, int M, int N, bool has_bias){
+  int gidC = blockDim.x * blockIdx.x + threadIdx.x;
+  int gidR = blockDim.y * blockIdx.y + threadIdx.y;
+  int tidC = threadIdx.x;
+  int tidR = threadIdx.y;
+
+  __shared__ float Asub[TSIZE][TSIZE];
+  __shared__ float Bsub[TSIZE][TSIZE];
+
+  float sum = 0.0f;
+  if (has_bias) sum += bias[gidC];
+
+  for (int offset = 0; offset < K; offset += TSIZE) {
+    Asub[tidR][tidC] = (offset + tidC < K) ? A[gidR * K + offset + tidC] : 0;
+    Bsub[tidR][tidC] = (offset + tidR < K) ? B[gidC * K + offset + tidR] : 0;
+
+    __syncthreads();
+
+    for (int k = 0; k < TSIZE; k++) {
+      sum += Asub[tidR][k] * Bsub[k][tidC];
+    }
+
+    __syncthreads();
+  }
+  C[gidR * M + gidC] = sum;
+}
+
+void matmul(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
+            bool has_bias) {
+  float *in = input->gbuf;
+  float *out = output->gbuf;
+  float *w = weight->gbuf;
+  float *b = bias->gbuf;
+
+  int K = input->shape[2];
+  int M = output->shape[2];
+  int N = BATCH;
+
+  dim3 block(TSIZE, TSIZE);
+  dim3 grid(CEIL_DIV(M, TSIZE), CEIL_DIV(N, TSIZE));
+  matmul_kernel<<<grid, block>>>(in, w, out, b, K, M, N, has_bias);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 }
