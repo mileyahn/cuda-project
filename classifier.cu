@@ -341,19 +341,19 @@ void collapse(Tensor *input, Tensor *output) {
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-__global__ void linear_kernel(float *in, float *out, float *weight, float *bias, int IC, int OC, bool has_bias){
+__global__ void linear_kernel(float *in, float *out, float *weight, float *bias, int K, int M, int N, bool has_bias){
   int tidx = blockIdx.x * blockDim.x + threadIdx.x;
-  int b = tidx / OC;
-  int oc = tidx % OC;
+  int n = tidx / M;
+  int m = tidx % M;
 
-  if(oc >= OC) return;
+  if(m >= M) return;
 
-  float val = 0.0;
-  for (int ic = 0; ic < IC; ++ic) {
-    val += in[b * IC + ic] * weight[oc * IC + ic];
+  float sum = 0.0;
+  for (int k = 0; k < K; ++k) {
+    sum += in[n * K + k] * weight[m * K + k];
   }
-  if (has_bias) val += bias[oc];
-  out[b * OC + oc] = val;
+  if (has_bias) sum += bias[m];
+  out[n * M + m] = sum;
 }
 
 void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
@@ -363,14 +363,15 @@ void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   float *w = weight->gbuf;
   float *b = bias->gbuf;
 
-  int IC = input->shape[2];
-  int OC = output->shape[2];
+  int K = input->shape[2];
+  int M = output->shape[2];
+  int N = BATCH;
 
-  int total_threads = BATCH * OC;
+  int total_threads = M * N;
   int block_size = 512;
-  dim3 blockDim(block_size);
-  dim3 gridDim((total_threads + block_size - 1) / block_size);
-  linear_kernel<<<gridDim, blockDim>>>(in, out, w, b, IC, OC, has_bias);
+  dim3 block(block_size);
+  dim3 grid((total_threads + block_size - 1) / block_size);
+  linear_kernel<<<grid, block>>>(in, out, w, b, K, M, N, has_bias);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 }
