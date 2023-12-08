@@ -116,7 +116,7 @@ void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             bool has_bias);
 void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output);
 //me
-void find_maxIdx(Tensor *input, Tensor *output, int n);
+void find_maxIdx(Tensor *input, Tensor *output, int idx, int N);
 
 void check(Tensor *t_b, Tensor *t_bb){
   t_b->toCPU();
@@ -209,23 +209,11 @@ void classifier(float *input_, float *output_, int N) {
 
       // FC block 3 : Linear
       linear(a_relu8, w_fc3, b_fc3, a_linear3, true);
-      a_linear3->toCPU();
-      // find_maxIdx(a_linear3, a_output, idx);
-      for(int b = 0; b < BATCH; b++){
-        float max_val = -1e99f;
-        int max_idx = 0;
-        int num = a_linear3->num_elem() / BATCH;
-        for (int i = 0; i < num; ++i) {
-          if (a_linear3->buf[b * num + i] > max_val) {
-            max_val = a_linear3->buf[b * num + i];
-            max_idx = i;
-          }
-        }
-        if(idx * BATCH + b >= N) break;
-        output_[idx * BATCH + b] = max_idx;
-      }
-      // CHECK_CUDA(cudaMemcpy(output_ + BATCH * idx, a_output->gbuf, BATCH * sizeof(float), cudaMemcpyDeviceToHost));
-      // CHECK_CUDA(cudaDeviceSynchronize());
+
+      find_maxIdx(a_linear3, a_output, idx, N);
+
+      CHECK_CUDA(cudaMemcpy(output_ + BATCH * idx, a_output->gbuf, BATCH * sizeof(float), cudaMemcpyDeviceToHost));
+      CHECK_CUDA(cudaDeviceSynchronize());
     }
     //}  // end N input sentences loop
   // }    // if mpi_rank == 0
@@ -412,27 +400,30 @@ void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output) {
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-__global__ void find_maxIdx_kernel(float *in, float *out, int N, int idx){
-  for(int b = 0; b < BATCH; b++){
-    float max_val = -1e99f;
-    int max_idx = 0;
-    for (int i = 0; i < N; ++i) {
-      if (in[b * N + i] > max_val) {
-        max_val = in[b * N + i];
-        max_idx = i;
-      }
+__global__ void find_maxIdx_kernel(float *in, float *out, int N, int idx, int num){
+  int b = blockDim.y * blockIdx.y + threadIdx.y;
+
+  // if(idx * BATCH + b > N) return;
+
+  float max_val = -1e99f;
+  int max_idx = 0;
+  for (int i = 0; i < num; ++i) {
+    if (in[b * num + i] > max_val) {
+      max_val = in[b * num + i];
+      max_idx = i;
     }
-    out[idx * BATCH + b] = max_idx;
-    if(idx * BATCH + b >= N) break;
   }
+  out[b] = max_idx;
 }
 
-void find_maxIdx(Tensor *input, Tensor *output, int idx) {
+void find_maxIdx(Tensor *input, Tensor *output, int idx, int N) {
   float *in = input->gbuf;
   float *out = output->gbuf;
-  int N = input->num_elem() / BATCH;
+  int num = input->num_elem() / BATCH;
 
-  find_maxIdx_kernel<<<1, 1>>>(in, out, N, idx);
+  dim3 block(1, 1);
+  dim3 grid(1, BATCH);
+  find_maxIdx_kernel<<<grid, block>>>(in, out, N, idx, num);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 }
