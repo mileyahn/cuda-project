@@ -17,6 +17,8 @@
     }                                                                 \
   } while (0)
 
+#define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
+#define BATCH 4
 // Multi-dimensional matrix containing fp32 elements
 struct Tensor {
   Tensor(std::vector<int> shape_);
@@ -101,6 +103,8 @@ Tensor *a_collapse;
 Tensor *a_linear1, *a_relu7;
 Tensor *a_linear2, *a_relu8;
 Tensor *a_linear3;
+//me
+Tensor *a_output;
 
 // Operations
 void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
@@ -111,19 +115,57 @@ void collapse(Tensor *input, Tensor *output);
 void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             bool has_bias);
 void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output);
+//me
+void find_maxIdx(Tensor *input, Tensor *output, int n);
+
+void check(Tensor *t_b, Tensor *t_bb){
+  t_b->toCPU();
+  t_bb->toCPU();
+  int count = 0;
+  printf("no batch : %d, batch : %d\n", t_b->num_elem(), t_bb->num_elem());
+  for (int i=0; i<t_b->num_elem(); ++i){
+    if (t_b->buf[i] != t_bb->buf[i]){
+      printf("%d : %f <-> %f\n", i, t_b->buf[i], t_bb->buf[i]);
+      count++;
+      if(count >= 10) break;
+    }
+  }
+  printf("\n finish \n");
+}
+
+void why0(Tensor *t){
+  t->toCPU();
+  bool ok = true;
+  int count = 0;
+  for(int i = 0; i < t->num_elem(); i++){
+    printf(" %f", t->buf[i]);
+    if(t->buf[i] == 0.0f){
+      count++;
+    }else{
+      count = 0;
+    }
+    if(count == 100){
+      ok = false;
+      printf("here!!!!!!!! %d\n", i);
+      break;
+    }
+  }
+  if(ok) printf("\n*****successful %d******\n", t->num_elem());
+}
 
 // Only the first process (root, mpi_rank == 0) has the input and output
 // Parallelization method is totally up to you, but you should gather 
 // the output at rank 0
 void classifier(float *input_, float *output_, int N) {
   // if (mpi_rank == 0) {
-    for (int n = 0; n < N; ++n) {  // N input sentences
+    int loop = (BATCH + N - 1) / BATCH;
+    for (int idx = 0; idx < loop; ++idx) {  // N input sentences
 
       // Load one input sentence from input
-      Tensor *one_input = new Tensor({1, VOCAB_SIZE, MAX_LENGTH}, input_ + n * VOCAB_SIZE * MAX_LENGTH);
+      Tensor *one_input = new Tensor({BATCH, 1, VOCAB_SIZE, MAX_LENGTH}, input_ + idx * BATCH * VOCAB_SIZE * MAX_LENGTH);
 
       // yelim!!
-      CHECK_CUDA(cudaMemcpy(one_input->gbuf, input_ + n * VOCAB_SIZE * MAX_LENGTH, VOCAB_SIZE * MAX_LENGTH * sizeof(float), cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(one_input->gbuf, input_ + idx * BATCH * VOCAB_SIZE * MAX_LENGTH, BATCH * VOCAB_SIZE * MAX_LENGTH * sizeof(float), cudaMemcpyHostToDevice));
       
       // Conv block 1 : Conv1d + LayerNorm + ReLU + MaxPool1d
       conv1d(one_input, w_conv1, b_conv1, a_conv1, 1, 0, 1, true);
@@ -135,11 +177,11 @@ void classifier(float *input_, float *output_, int N) {
       conv1d(a_pool1, w_conv2, b_conv2, a_conv2, 1, 0, 1, true);
       relu(a_conv2, a_relu2);
       maxpool1d(a_relu2, a_pool2, 3, 3);
-
+      
       // Conv block 3 : Conv1d + ReLU
       conv1d(a_pool2, w_conv3, b_conv3, a_conv3, 1, 0, 1, true);
       relu(a_conv3, a_relu3);
-
+      
       // Conv block 4 : Conv1d + ReLU
       conv1d(a_relu3, w_conv4, b_conv4, a_conv4, 1, 0, 1, true);
       relu(a_conv4, a_relu4);
@@ -153,10 +195,10 @@ void classifier(float *input_, float *output_, int N) {
       layernorm(a_conv6, gamma_conv6, beta_conv6, a_layernorm6);
       relu(a_layernorm6, a_relu6);
       maxpool1d(a_relu6, a_pool6, 3, 3);
-
+      
       // Collapse
       collapse(a_pool6, a_collapse);
-
+      
       // FC block 1 : Linear + ReLU
       linear(a_collapse, w_fc1, b_fc1, a_linear1, true);
       relu(a_linear1, a_relu7);
@@ -168,44 +210,45 @@ void classifier(float *input_, float *output_, int N) {
       // FC block 3 : Linear
       linear(a_relu8, w_fc3, b_fc3, a_linear3, true);
       a_linear3->toCPU();
-
-      float max_val = -1e99f;
-      int max_idx = 0;
-      for (int i = 0; i < a_linear3->num_elem(); ++i) {
-        if (a_linear3->buf[i] > max_val) {
-          max_val = a_linear3->buf[i];
-          max_idx = i;
+      // find_maxIdx(a_linear3, a_output, idx);
+      for(int b = 0; b < BATCH; b++){
+        float max_val = -1e99f;
+        int max_idx = 0;
+        int num = a_linear3->num_elem() / BATCH;
+        for (int i = 0; i < num; ++i) {
+          if (a_linear3->buf[b * num + i] > max_val) {
+            max_val = a_linear3->buf[b * num + i];
+            max_idx = i;
+          }
         }
+        if(idx * BATCH + b >= N) break;
+        output_[idx * BATCH + b] = max_idx;
       }
-
-      output_[n] = max_idx;
-
-      // yelim
-      // Tensor *one_output = new Tensor({1}, output_ + n);
-
-      // CHECK_CUDA(cudaMemcpy(output_ + n, one_output->gbuf, sizeof(float), cudaMemcpyDeviceToHost));
+      // CHECK_CUDA(cudaMemcpy(output_ + BATCH * idx, a_output->gbuf, BATCH * sizeof(float), cudaMemcpyDeviceToHost));
       // CHECK_CUDA(cudaDeviceSynchronize());
-    }  // end N input sentences loop
+    }
+    //}  // end N input sentences loop
   // }    // if mpi_rank == 0
 }
 
-__global__ void conv1d_kernel(float *in, float *out, float *w, float *b, int out_channels, int in_channels, int kernel_size, int input_length, int output_length, bool has_bias){
+__global__ void conv1d_kernel(float *in, float *out, float *weight, float *bias, int out_channels, int in_channels, int kernel_size, int input_length, int output_length, bool has_bias){
   int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = tidx / (out_channels * output_length);
   int oc = (tidx / output_length) % out_channels;
   int ol = tidx % output_length;
 
   if(oc >= out_channels || ol >= output_length) return;  
-
+  
   float val = 0.0f;
   int offset = ol;
   for (int ic = 0; ic < in_channels; ++ic) {
     for (int ks = 0; ks < kernel_size; ++ks) {
-      val += w[oc * in_channels * kernel_size + ic * kernel_size + ks] *
-                 in[ic * input_length + ks + offset];
+      val += weight[oc * in_channels * kernel_size + ic * kernel_size + ks] *
+                 in[b * in_channels * input_length + ic * input_length + ks + offset];
     }
   }
-  if (has_bias) val += b[oc];
-  out[oc * output_length + ol] = val;  
+  if (has_bias) val += bias[oc];
+  out[b * out_channels * output_length + oc * output_length + ol] = val;  
 }
 
 void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
@@ -219,11 +262,11 @@ void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   int out_channels = weight->shape[0];
   int in_channels = weight->shape[1];
   int kernel_size = weight->shape[2];
-  int input_length = input->shape[2];
+  int input_length = input->shape[3];
   int output_length =
-      (input->shape[2] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+      (input->shape[3] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
 
-  int total_threads = out_channels * output_length;
+  int total_threads = BATCH * out_channels * output_length;
   int block_size = 1024; 
   dim3 blockDim(block_size);
   dim3 gridDim((total_threads + block_size - 1) / block_size);
@@ -231,98 +274,6 @@ void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 }
-
-// void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
-//             int stride = 1, int padding = 0, int dilation = 1,
-//             bool has_bias = true) {
-//   int out_channels = weight->shape[0];
-//   int in_channels = weight->shape[1];
-//   int kernel_size = weight->shape[2];
-//   int input_length = input->shape[2];
-//   int output_length =
-//       (input->shape[2] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
-
-//   for (int oc = 0; oc < out_channels; ++oc) {
-//     for (int ol = 0; ol < output_length; ++ol) {
-//       float val = 0.0f;
-//       int offset = ol;
-//       for (int ic = 0; ic < in_channels; ++ic) {
-//         for (int ks = 0; ks < kernel_size; ++ks) {
-//           val += weight->buf[oc * in_channels * kernel_size + ic * kernel_size + ks] *
-//                  input->buf[ic * input_length + ks + offset];
-//         }
-//       }
-//       if (has_bias) val += bias->buf[oc];
-//       output->buf[oc * output_length + ol] = val;
-//     }
-//   }
-// }
-
-// void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride) {
-//   int IL = input->shape[2];
-//   int OC = output->shape[1];
-//   int OL = output->shape[2];
-
-//   for (int oc = 0; oc < OC; ++oc) {
-//     for (int ol = 0; ol < OL; ++ol) {
-//       float mx = -1e99;
-//       for (int ks = 0; ks < kernel_size; ++ks) {
-//         float val = input->buf[oc * IL + ks + ol * stride];
-//         if (val > mx) mx = val;
-//       }
-//       output->buf[oc * OL + ol] = mx;
-//     }
-//   }
-// }
-
-// void relu(Tensor *input, Tensor *output) {
-//   for (int i = 0; i < input->num_elem(); ++i) {
-//     if (input->buf[i] > 0.0f)
-//       output->buf[i] = input->buf[i];
-//     else
-//       output->buf[i] = 0.0f;
-//   }
-// }
-
-// void collapse(Tensor *input, Tensor *output) {
-//   for (int i = 0; i < input->num_elem(); ++i) {
-//     output->buf[i] = input->buf[i];
-//   }
-// }
-
-// void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
-//             bool has_bias) {
-//   int IC = input->shape[1];
-//   int OC = output->shape[1];
-
-//   for (int oc = 0; oc < OC; ++oc) {
-//     float val = 0.0;
-//     for (int ic = 0; ic < IC; ++ic) {
-//       val += input->buf[ic] * weight->buf[oc * IC + ic];
-//     }
-//     if (has_bias) val += bias->buf[oc];
-//     output->buf[oc] = val;
-//   }
-// }
-
-// void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output) {
-//   // E[X], E[X^2]
-//   float sum1 = 0.0f, sum2 = 0.0f;
-//   for (int i = 0; i < input->num_elem(); ++i) {
-//       sum1 += input->buf[i];
-//       sum2 += input->buf[i] * input->buf[i];
-//   }
-//   float mean1 = sum1 / (float)input->num_elem();
-//   float mean2 = sum2 / (float)input->num_elem();
-
-//   // V[X]
-//   float var = mean2 - mean1 * mean1; 
-
-//   // Normalization
-//   for (int i = 0; i < input->num_elem(); ++i) {
-//     output->buf[i] = (input->buf[i] - mean1) / sqrtf(var + 1e-5) * gamma->buf[i] + beta->buf[i];
-//   }
-// }
 
 __global__ void relu_kernel(float *in, float *out, int N){
   int tidx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -335,38 +286,37 @@ void relu(Tensor *input, Tensor *output) {
   float *out = output->gbuf;
   int N = input->num_elem();
 
-  int total_threads = N;
-  int block_size = 32;
-  dim3 blockDim(block_size);
-  dim3 gridDim((total_threads + block_size - 1) / block_size);
-  relu_kernel<<<gridDim, blockDim>>>(in, out, N);
+  relu_kernel<<<CEIL_DIV(N, 256), 256>>>(in, out, N);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 __global__ void maxpool1d_kernel(float *in, float *out, int IL, int OC, int OL, int kernel_size, int stride){
   int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = tidx / (OL * OC);
   int oc = (tidx / OL) % OC;
   int ol = tidx % OL;
   if(oc >= OC || ol >= OL) return;
 
+  int i_idx = b * OC * IL + oc * IL + ol * stride;
+  int o_idx = b * OC * OL + oc * OL + ol;
   float mx = -1e99;
   for (int ks = 0; ks < kernel_size; ++ks) {
-    float val = in[oc * IL + ks + ol * stride];
+    float val = in[i_idx + ks];
     if (val > mx) mx = val;
   }
-  out[oc * OL + ol] = mx;
+  out[o_idx] = mx;
 }
 
 void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride) {
   float *in = input->gbuf;
   float *out = output->gbuf;
 
-  int IL = input->shape[2];
-  int OC = output->shape[1];
-  int OL = output->shape[2];
+  int IL = input->shape[3];
+  int OC = output->shape[2];
+  int OL = output->shape[3];
 
-  int total_threads = OC * OL;
+  int total_threads = BATCH * OC * OL;
   int block_size = 512;
   dim3 blockDim(block_size);
   dim3 gridDim((total_threads + block_size - 1) / block_size);
@@ -386,26 +336,24 @@ void collapse(Tensor *input, Tensor *output) {
   float *out = output->gbuf;
   int N = input->num_elem();
 
-  int total_threads = N;
-  int block_size = 512;
-  dim3 blockDim(block_size);
-  dim3 gridDim((total_threads + block_size - 1) / block_size);
-  collapse_kernel<<<gridDim, blockDim>>>(in, out, N);
+  collapse_kernel<<<CEIL_DIV(N, 256), 256>>>(in, out, N);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-__global__ void linear_kernel(float *in, float *out, float *w, float *b, int IC, int OC, bool has_bias){
-  int oc = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void linear_kernel(float *in, float *out, float *weight, float *bias, int IC, int OC, bool has_bias){
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = tidx / OC;
+  int oc = tidx % OC;
 
   if(oc >= OC) return;
 
   float val = 0.0;
   for (int ic = 0; ic < IC; ++ic) {
-    val += in[ic] * w[oc * IC + ic];
+    val += in[b * IC + ic] * weight[oc * IC + ic];
   }
-  if (has_bias) val += b[oc];
-  out[oc] = val;
+  if (has_bias) val += bias[oc];
+  out[b * OC + oc] = val;
 }
 
 void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
@@ -415,10 +363,10 @@ void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   float *w = weight->gbuf;
   float *b = bias->gbuf;
 
-  int IC = input->shape[1];
-  int OC = output->shape[1];
+  int IC = input->shape[2];
+  int OC = output->shape[2];
 
-  int total_threads = OC;
+  int total_threads = BATCH * OC;
   int block_size = 512;
   dim3 blockDim(block_size);
   dim3 gridDim((total_threads + block_size - 1) / block_size);
@@ -427,12 +375,15 @@ void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-__global__ void layernorm_kernel(float *in, float *out, float *g, float *b, int N){
+__global__ void layernorm_kernel(float *in, float *out, float *gamma, float *bias, int N){
+  int b = blockDim.y * blockIdx.y + threadIdx.y;
+  int idx = b * N;
+
   // E[X], E[X^2]
   float sum1 = 0.0f, sum2 = 0.0f;
   for (int i = 0; i < N; ++i) {
-      sum1 += in[i];
-      sum2 += in[i] * in[i];
+      sum1 += in[idx + i];
+      sum2 += in[idx + i] * in[idx + i];
   }
   float mean1 = sum1 / (float)N;
   float mean2 = sum2 / (float)N;
@@ -442,7 +393,7 @@ __global__ void layernorm_kernel(float *in, float *out, float *g, float *b, int 
 
   // Normalization
   for (int i = 0; i < N; ++i) {
-    out[i] = (in[i] - mean1) / sqrtf(var + 1e-5) * g[i] + b[i];
+    out[idx + i] = (in[idx + i] - mean1) / sqrtf(var + 1e-5) * gamma[i] + bias[i];
   }
 }
 
@@ -451,9 +402,36 @@ void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output) {
   float *out = output->gbuf;
   float *g = gamma->gbuf;
   float *b = beta->gbuf;
-  int N = input->num_elem();
+  int N = input->num_elem() / BATCH;
 
-  layernorm_kernel<<<1, 1>>>(in, out, g, b, N);
+  dim3 block(1, 1);
+  dim3 grid(1, BATCH);
+  layernorm_kernel<<<grid, block>>>(in, out, g, b, N);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+__global__ void find_maxIdx_kernel(float *in, float *out, int N, int idx){
+  for(int b = 0; b < BATCH; b++){
+    float max_val = -1e99f;
+    int max_idx = 0;
+    for (int i = 0; i < N; ++i) {
+      if (in[b * N + i] > max_val) {
+        max_val = in[b * N + i];
+        max_idx = i;
+      }
+    }
+    out[idx * BATCH + b] = max_idx;
+    if(idx * BATCH + b >= N) break;
+  }
+}
+
+void find_maxIdx(Tensor *input, Tensor *output, int idx) {
+  float *in = input->gbuf;
+  float *out = output->gbuf;
+  int N = input->num_elem() / BATCH;
+
+  find_maxIdx_kernel<<<1, 1>>>(in, out, N, idx);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 }
@@ -487,29 +465,32 @@ void initialize_classifier(float *parameter, int N) {
     w_fc3 = new Tensor({4, 1024}, parameter + OFFSET20);
     b_fc3 = new Tensor({4}, parameter + OFFSET21);
 
-    a_conv1 = new Tensor({1, 256, 1008});
-    a_layernorm1 = new Tensor({1, 256, 1008});
-    a_relu1 = new Tensor({1, 256, 1008});
-    a_pool1 = new Tensor({1, 256, 336});
-    a_conv2 = new Tensor({1, 256, 330});
-    a_relu2 = new Tensor({1, 256, 330});
-    a_pool2 = new Tensor({1, 256, 110});
-    a_conv3 = new Tensor({1, 256, 108});
-    a_relu3 = new Tensor({1, 256, 108});
-    a_conv4 = new Tensor({1, 256, 106});
-    a_relu4 = new Tensor({1, 256, 106});
-    a_conv5 = new Tensor({1, 256, 104});
-    a_relu5 = new Tensor({1, 256, 104});
-    a_conv6 = new Tensor({1, 256, 102});
-    a_layernorm6 = new Tensor({1, 256, 102});
-    a_relu6 = new Tensor({1, 256, 102});
-    a_pool6 = new Tensor({1, 256, 34});
-    a_collapse = new Tensor({1, 8704});
-    a_linear1 = new Tensor({1, 1024});
-    a_relu7 = new Tensor({1, 1024});
-    a_linear2 = new Tensor({1, 1024});
-    a_relu8 = new Tensor({1, 1024});
-    a_linear3 = new Tensor({1, 4});
+    a_conv1 = new Tensor({BATCH, 1, 256, 1008});
+    a_layernorm1 = new Tensor({BATCH, 1, 256, 1008});
+    a_relu1 = new Tensor({BATCH, 1, 256, 1008});
+    a_pool1 = new Tensor({BATCH, 1, 256, 336});
+    a_conv2 = new Tensor({BATCH, 1, 256, 330});
+    a_relu2 = new Tensor({BATCH, 1, 256, 330});
+    a_pool2 = new Tensor({BATCH, 1, 256, 110});
+    a_conv3 = new Tensor({BATCH, 1, 256, 108});
+    a_relu3 = new Tensor({BATCH, 1, 256, 108});
+    a_conv4 = new Tensor({BATCH, 1, 256, 106});
+    a_relu4 = new Tensor({BATCH, 1, 256, 106});
+    a_conv5 = new Tensor({BATCH, 1, 256, 104});
+    a_relu5 = new Tensor({BATCH, 1, 256, 104});
+    a_conv6 = new Tensor({BATCH, 1, 256, 102});
+    a_layernorm6 = new Tensor({BATCH, 1, 256, 102});
+    a_relu6 = new Tensor({BATCH, 1, 256, 102});
+    a_pool6 = new Tensor({BATCH, 1, 256, 34});
+    a_collapse = new Tensor({BATCH, 1, 8704});
+    a_linear1 = new Tensor({BATCH, 1, 1024});
+    a_relu7 = new Tensor({BATCH, 1, 1024});
+    a_linear2 = new Tensor({BATCH, 1, 1024});
+    a_relu8 = new Tensor({BATCH, 1, 1024});
+    a_linear3 = new Tensor({BATCH, 1, 4});
+
+    //yelim
+    a_output = new Tensor({BATCH, 1});
   // }
 }
 
@@ -561,5 +542,7 @@ void finalize_classifier() {
     delete a_linear2;
     delete a_relu8;
     delete a_linear3;
+    //yelim
+    delete a_output;
   // }
 }
