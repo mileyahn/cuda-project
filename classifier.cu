@@ -7,10 +7,10 @@
 #include "util.h"
 
 static int mpi_rank;
+int BATCH = 2048;
 
 #define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
-#define DEBUG 0
-#define BATCH 2
+#define DEBUG 1
 #define TSIZE 2
 #define RSIZE 16
 #define NGPU 4
@@ -36,9 +36,6 @@ struct Tensor {
   float *gbuf[NGPU] = {nullptr, nullptr, nullptr, nullptr};
   int ndim = 0;
   int shape[4];
-
-  void toCPU();
-  void toGPU();
 };
 
 Tensor::Tensor(std::vector<int> shape_) {
@@ -71,14 +68,6 @@ Tensor::Tensor(std::vector<int> shape_, float *buf_) {
     CHECK_CUDA(
         cudaMemcpy(gbuf[i], buf, N_ * sizeof(float), cudaMemcpyHostToDevice));
   }
-}
-
-void Tensor::toCPU(){
-  CHECK_CUDA(cudaMemcpy(buf, gbuf, num_elem() * sizeof(float), cudaMemcpyDeviceToHost));
-}
-
-void Tensor::toGPU(){
-  CHECK_CUDA(cudaMemcpy(gbuf, buf, num_elem() * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 Tensor::~Tensor() {
@@ -135,13 +124,6 @@ void vector_sum(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output, int gpuIdx);
 //me
 void find_maxIdx(Tensor *input, Tensor *output, int idx, int N, int gpuIdx);
-
-void check(Tensor *t){
-  t->toCPU();
-  for(int i = 0; i< t->num_elem(); i++){
-    printf(" %f", t->buf[i]);
-  }
-}
 
 // Only the first process (root, mpi_rank == 0) has the input and output
 // Parallelization method is totally up to you, but you should gather 
@@ -257,8 +239,10 @@ void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output, int gpu
   dim3 blockDim(block_size);
   dim3 gridDim((total_threads + block_size - 1) / block_size);
   conv1d_kernel<<<gridDim, blockDim>>>(in, out, w, b, out_channels, in_channels, kernel_size, input_length, output_length, has_bias);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 __global__ void relu_kernel(float *in, float *out, int N){
@@ -273,8 +257,10 @@ void relu(Tensor *input, Tensor *output, int gpuIdx) {
   int N = input->num_elem();
 
   relu_kernel<<<CEIL_DIV(N, 256), 256>>>(in, out, N);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 __global__ void maxpool1d_kernel(float *in, float *out, int IL, int OC, int OL, int kernel_size, int stride){
@@ -307,8 +293,10 @@ void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride, int g
   dim3 blockDim(block_size);
   dim3 gridDim((total_threads + block_size - 1) / block_size);
   maxpool1d_kernel<<<gridDim, blockDim>>>(in, out, IL, OC, OL, kernel_size, stride);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 __global__ void collapse_kernel(float *in, float *out, int N){
@@ -323,8 +311,10 @@ void collapse(Tensor *input, Tensor *output, int gpuIdx) {
   int N = input->num_elem();
 
   collapse_kernel<<<CEIL_DIV(N, 256), 256>>>(in, out, N);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 __global__ void matmul_kernel(float *A, float *B, float *C, float *bias, int K, int M, int N, bool has_bias){
@@ -368,8 +358,10 @@ void matmul(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   dim3 block(TSIZE, TSIZE);
   dim3 grid(CEIL_DIV(M, TSIZE), CEIL_DIV(N, TSIZE));
   matmul_kernel<<<grid, block>>>(in, w, out, b, K, M, N, has_bias);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 __global__ void vector_sum_kernel(float *in, float *out, float *weight, float *bias, int K, int M, bool has_bias){
@@ -431,8 +423,10 @@ void vector_sum(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   dim3 block(RSIZE, 1);
   dim3 grid(CEIL_DIV(K, RSIZE), B);
   vector_sum_kernel<<<grid, block>>>(in, out, w, b, K, M, has_bias);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 __global__ void layernorm_kernel(float *in, float *out, float *gamma, float *bias, int N){
@@ -467,8 +461,10 @@ void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output, int g
   dim3 block(1, 1);
   dim3 grid(1, BATCH);
   layernorm_kernel<<<grid, block>>>(in, out, g, b, N);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 __global__ void find_maxIdx_kernel(float *in, float *out, int N, int idx, int num){
@@ -495,8 +491,10 @@ void find_maxIdx(Tensor *input, Tensor *output, int idx, int N, int gpuIdx) {
   dim3 block(1, 1);
   dim3 grid(1, BATCH);
   find_maxIdx_kernel<<<grid, block>>>(in, out, N, idx, num);
-  CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
+  #if DEBUG
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+  #endif
 }
 
 // load the parameter binary file and store parameters into Tensors
@@ -505,6 +503,10 @@ void find_maxIdx(Tensor *input, Tensor *output, int idx, int N, int gpuIdx) {
 void initialize_classifier(float *parameter, int N) {
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   if (mpi_rank == 0) {
+    if ((N / NGPU) < BATCH) {
+      BATCH = N / NGPU;
+    }
+
     w_conv1 = new Tensor({256, 70, 7}, parameter + OFFSET0);
     b_conv1 = new Tensor({256}, parameter + OFFSET1);
     gamma_conv1 = new Tensor({256, 1008}, parameter + OFFSET2);
