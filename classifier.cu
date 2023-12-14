@@ -1,12 +1,19 @@
 #include <math.h>
 #include <mpi.h>
 #include <cassert>
+#include <thread>
 
 #include "classifier.h"
 #include "util.h"
 
 static int mpi_rank;
 
+#define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
+#define DEBUG 0
+#define BATCH 2
+#define TSIZE 2
+#define RSIZE 16
+#define NGPU 4
 #define CHECK_CUDA(call)                                              \
   do {                                                                \
     cudaError_t status_ = call;                                       \
@@ -17,11 +24,6 @@ static int mpi_rank;
     }                                                                 \
   } while (0)
 
-#define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
-#define BATCH 4
-#define TSIZE 4
-#define RSIZE 16
-
 // Multi-dimensional matrix containing fp32 elements
 struct Tensor {
   Tensor(std::vector<int> shape_);
@@ -31,7 +33,7 @@ struct Tensor {
   void fill_zeros();
 
   float *buf = nullptr;
-  float *gbuf = nullptr;
+  float *gbuf[NGPU] = {nullptr, nullptr, nullptr, nullptr};
   int ndim = 0;
   int shape[4];
 
@@ -47,7 +49,10 @@ Tensor::Tensor(std::vector<int> shape_) {
   //reshape fin
 
   CHECK_CUDA(cudaMallocHost(&buf, N_ * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&gbuf, N_ * sizeof(float)));
+  for (int i = 0; i < NGPU; i++) {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMalloc(&gbuf[i], N_ * sizeof(float)));
+  }
 }
 
 Tensor::Tensor(std::vector<int> shape_, float *buf_) {
@@ -58,9 +63,14 @@ Tensor::Tensor(std::vector<int> shape_, float *buf_) {
   // reshape fin
 
   CHECK_CUDA(cudaMallocHost(&buf, N_ * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&gbuf, N_ * sizeof(float)));
+
   memcpy(buf, buf_, N_ * sizeof(float));
-  CHECK_CUDA(cudaMemcpy(gbuf, buf_, N_ * sizeof(float), cudaMemcpyHostToDevice));
+  for (int i = 0; i < NGPU; i++) {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMalloc(&gbuf[i], N_ * sizeof(float)));
+    CHECK_CUDA(
+        cudaMemcpy(gbuf[i], buf, N_ * sizeof(float), cudaMemcpyHostToDevice));
+  }
 }
 
 void Tensor::toCPU(){
@@ -73,7 +83,12 @@ void Tensor::toGPU(){
 
 Tensor::~Tensor() {
   if (buf != nullptr) CHECK_CUDA(cudaFreeHost(buf));
-  if (gbuf != nullptr) CHECK_CUDA(cudaFree(gbuf));
+  for (size_t i = 0; i < NGPU; i++) {
+    if (gbuf[i] != nullptr) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaFree(gbuf[i]));
+    }
+  }
 }
 
 int Tensor::num_elem() {
@@ -105,81 +120,101 @@ Tensor *a_linear2, *a_relu8;
 Tensor *a_linear3;
 //me
 Tensor *a_output;
+Tensor *a_input;
 
 // Operations
-void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
+void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output, int gpuIdx,
             int stride, int padding, int dilation, bool has_bias);
-void relu(Tensor *input, Tensor *output);
-void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride);
-void collapse(Tensor *input, Tensor *output);
+void relu(Tensor *input, Tensor *output, int gpuIdx);
+void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride, int gpuIdx);
+void collapse(Tensor *input, Tensor *output, int gpuIdx);
 void matmul(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
-            bool has_bias);
+            bool has_bias, int gpuIdx);
 void vector_sum(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
-            bool has_bias);
-void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output);
+            bool has_bias, int gpuIdx);
+void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output, int gpuIdx);
 //me
-void find_maxIdx(Tensor *input, Tensor *output, int idx, int N);
+void find_maxIdx(Tensor *input, Tensor *output, int idx, int N, int gpuIdx);
+
+void check(Tensor *t){
+  t->toCPU();
+  for(int i = 0; i< t->num_elem(); i++){
+    printf(" %f", t->buf[i]);
+  }
+}
 
 // Only the first process (root, mpi_rank == 0) has the input and output
 // Parallelization method is totally up to you, but you should gather 
 // the output at rank 0
-void classifier(float *input_, float *output_, int N) {
+void model_thread(float *input_, float *output_, int gpuIdx, int N) {
   if (mpi_rank == 0) {
-    for (int idx = 0; idx < CEIL_DIV(N, BATCH); ++idx) {  // N input sentences
+    CHECK_CUDA(cudaSetDevice(gpuIdx));
+    for (int idx = 0; idx < N / NGPU; idx += BATCH) {
 
-      // Load one input sentence from input
-      Tensor *one_input = new Tensor({BATCH, 1, VOCAB_SIZE, MAX_LENGTH}, input_ + idx * BATCH * VOCAB_SIZE * MAX_LENGTH);
-
-      // yelim!!
-      CHECK_CUDA(cudaMemcpy(one_input->gbuf, input_ + idx * BATCH * VOCAB_SIZE * MAX_LENGTH, BATCH * VOCAB_SIZE * MAX_LENGTH * sizeof(float), cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(a_input->gbuf[gpuIdx], input_ + idx * VOCAB_SIZE * MAX_LENGTH, BATCH * VOCAB_SIZE * MAX_LENGTH * sizeof(float), cudaMemcpyHostToDevice));
       
       // Conv block 1 : Conv1d + LayerNorm + ReLU + MaxPool1d
-      conv1d(one_input, w_conv1, b_conv1, a_conv1, 1, 0, 1, true);
-      layernorm(a_conv1, gamma_conv1, beta_conv1, a_layernorm1);
-      relu(a_layernorm1, a_relu1);
-      maxpool1d(a_relu1, a_pool1, 3, 3);
+      conv1d(a_input, w_conv1, b_conv1, a_conv1, gpuIdx, 1, 0, 1, true);
+      
+      layernorm(a_conv1, gamma_conv1, beta_conv1, a_layernorm1, gpuIdx);
+      relu(a_layernorm1, a_relu1, gpuIdx);
+      maxpool1d(a_relu1, a_pool1, 3, 3, gpuIdx);
 
       // Conv block 2 : Conv1d + ReLU + MaxPool1d
-      conv1d(a_pool1, w_conv2, b_conv2, a_conv2, 1, 0, 1, true);
-      relu(a_conv2, a_relu2);
-      maxpool1d(a_relu2, a_pool2, 3, 3);
+      conv1d(a_pool1, w_conv2, b_conv2, a_conv2, gpuIdx, 1, 0, 1, true);
+      relu(a_conv2, a_relu2, gpuIdx);
+      maxpool1d(a_relu2, a_pool2, 3, 3, gpuIdx);
       
       // Conv block 3 : Conv1d + ReLU
-      conv1d(a_pool2, w_conv3, b_conv3, a_conv3, 1, 0, 1, true);
-      relu(a_conv3, a_relu3);
+      conv1d(a_pool2, w_conv3, b_conv3, a_conv3, gpuIdx, 1, 0, 1, true);
+      relu(a_conv3, a_relu3, gpuIdx);
       
       // Conv block 4 : Conv1d + ReLU
-      conv1d(a_relu3, w_conv4, b_conv4, a_conv4, 1, 0, 1, true);
-      relu(a_conv4, a_relu4);
+      conv1d(a_relu3, w_conv4, b_conv4, a_conv4, gpuIdx, 1, 0, 1, true);
+      relu(a_conv4, a_relu4, gpuIdx);
 
       // Conv block 5 : Conv1d + ReLU
-      conv1d(a_relu4, w_conv5, b_conv5, a_conv5, 1, 0, 1, true);
-      relu(a_conv5, a_relu5);
+      conv1d(a_relu4, w_conv5, b_conv5, a_conv5, gpuIdx, 1, 0, 1, true);
+      relu(a_conv5, a_relu5, gpuIdx);
 
       // Conv block 6 : Conv1d + LayerNorm + ReLU + MaxPool1d
-      conv1d(a_relu5, w_conv6, b_conv6, a_conv6, 1, 0, 1, true);
-      layernorm(a_conv6, gamma_conv6, beta_conv6, a_layernorm6);
-      relu(a_layernorm6, a_relu6);
-      maxpool1d(a_relu6, a_pool6, 3, 3);
+      conv1d(a_relu5, w_conv6, b_conv6, a_conv6, gpuIdx, 1, 0, 1, true);
+      layernorm(a_conv6, gamma_conv6, beta_conv6, a_layernorm6, gpuIdx);
+      relu(a_layernorm6, a_relu6, gpuIdx);
+      maxpool1d(a_relu6, a_pool6, 3, 3, gpuIdx);
       
       // Collapse
-      collapse(a_pool6, a_collapse);
-      
+      collapse(a_pool6, a_collapse, gpuIdx);
       // FC block 1 : Linear + ReLU
-      matmul(a_collapse, w_fc1, b_fc1, a_relu7, true);
+      matmul(a_collapse, w_fc1, b_fc1, a_linear1, true, gpuIdx);
+      relu(a_linear1, a_relu7, gpuIdx);
 
       // FC block 2 : Linear + ReLU
-      matmul(a_relu7, w_fc2, b_fc2, a_relu8, true);
+      matmul(a_relu7, w_fc2, b_fc2, a_linear2, true, gpuIdx);
+      relu(a_linear2, a_relu8, gpuIdx);
 
       // FC block 3 : Linear
-      vector_sum(a_relu8, w_fc3, b_fc3, a_linear3, true);
+      vector_sum(a_relu8, w_fc3, b_fc3, a_linear3, true, gpuIdx);
 
-      find_maxIdx(a_linear3, a_output, idx, N);
+      find_maxIdx(a_linear3, a_output, idx, N, gpuIdx);
 
-      CHECK_CUDA(cudaMemcpy(output_ + BATCH * idx, a_output->gbuf, BATCH * sizeof(float), cudaMemcpyDeviceToHost));
-      CHECK_CUDA(cudaDeviceSynchronize());
+      CHECK_CUDA(cudaMemcpy(output_ + idx, a_output->gbuf[gpuIdx], BATCH * sizeof(float), cudaMemcpyDeviceToHost));
     }
+    CHECK_CUDA(cudaDeviceSynchronize());
   }    // if mpi_rank == 0
+}
+
+void classifier(float *input_, float *output_, int N) {
+  std::thread threads[NGPU];
+  for (int gpuIdx = 0; gpuIdx < NGPU; gpuIdx++) {
+    int inPos = (N / NGPU) * gpuIdx; // N is always multiple of 4
+    threads[gpuIdx] = std::thread(model_thread, input_ + inPos * VOCAB_SIZE * MAX_LENGTH,
+                                  output_ + inPos, gpuIdx, N);
+  }
+
+  for (int gpuIdx = 0; gpuIdx < NGPU; gpuIdx++) {
+    threads[gpuIdx].join();
+  }
 }
 
 __global__ void conv1d_kernel(float *in, float *out, float *weight, float *bias, int out_channels, int in_channels, int kernel_size, int input_length, int output_length, bool has_bias){
@@ -202,13 +237,13 @@ __global__ void conv1d_kernel(float *in, float *out, float *weight, float *bias,
   out[b * out_channels * output_length + oc * output_length + ol] = val;  
 }
 
-void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
+void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output, int gpuIdx,
             int stride = 1, int padding = 0, int dilation = 1,
             bool has_bias = true) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
-  float *w = weight->gbuf;
-  float *b = bias->gbuf;
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
+  float *w = weight->gbuf[gpuIdx];
+  float *b = bias->gbuf[gpuIdx];
 
   int out_channels = weight->shape[0];
   int in_channels = weight->shape[1];
@@ -232,9 +267,9 @@ __global__ void relu_kernel(float *in, float *out, int N){
   out[tidx] = fmaxf(in[tidx], 0.0f);
 }
 
-void relu(Tensor *input, Tensor *output) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
+void relu(Tensor *input, Tensor *output, int gpuIdx) {
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
   int N = input->num_elem();
 
   relu_kernel<<<CEIL_DIV(N, 256), 256>>>(in, out, N);
@@ -259,9 +294,9 @@ __global__ void maxpool1d_kernel(float *in, float *out, int IL, int OC, int OL, 
   out[o_idx] = mx;
 }
 
-void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
+void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride, int gpuIdx) {
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
 
   int IL = input->shape[3];
   int OC = output->shape[2];
@@ -282,9 +317,9 @@ __global__ void collapse_kernel(float *in, float *out, int N){
   out[n] = in[n];
 }
 
-void collapse(Tensor *input, Tensor *output) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
+void collapse(Tensor *input, Tensor *output, int gpuIdx) {
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
   int N = input->num_elem();
 
   collapse_kernel<<<CEIL_DIV(N, 256), 256>>>(in, out, N);
@@ -316,15 +351,15 @@ __global__ void matmul_kernel(float *A, float *B, float *C, float *bias, int K, 
 
     __syncthreads();
   }
-  C[gidR * M + gidC] = sum > 0 ? sum : 0;
+  C[gidR * M + gidC] = sum;// > 0 ? sum : 0;
 }
 
 void matmul(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
-            bool has_bias) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
-  float *w = weight->gbuf;
-  float *b = bias->gbuf;
+            bool has_bias, int gpuIdx) {
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
+  float *w = weight->gbuf[gpuIdx];
+  float *b = bias->gbuf[gpuIdx];
 
   int K = input->shape[2];
   int M = output->shape[2];
@@ -381,11 +416,11 @@ __global__ void vector_sum_kernel(float *in, float *out, float *weight, float *b
 }
 
 void vector_sum(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
-            bool has_bias) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
-  float *w = weight->gbuf;
-  float *b = bias->gbuf;
+            bool has_bias, int gpuIdx) {
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
+  float *w = weight->gbuf[gpuIdx];
+  float *b = bias->gbuf[gpuIdx];
 
   int K = input->shape[2]; //1024
   int M = output->shape[2]; // 4
@@ -422,11 +457,11 @@ __global__ void layernorm_kernel(float *in, float *out, float *gamma, float *bia
   }
 }
 
-void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
-  float *g = gamma->gbuf;
-  float *b = beta->gbuf;
+void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output, int gpuIdx) {
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
+  float *g = gamma->gbuf[gpuIdx];
+  float *b = beta->gbuf[gpuIdx];
   int N = input->num_elem() / BATCH;
 
   dim3 block(1, 1);
@@ -452,9 +487,9 @@ __global__ void find_maxIdx_kernel(float *in, float *out, int N, int idx, int nu
   out[b] = max_idx;
 }
 
-void find_maxIdx(Tensor *input, Tensor *output, int idx, int N) {
-  float *in = input->gbuf;
-  float *out = output->gbuf;
+void find_maxIdx(Tensor *input, Tensor *output, int idx, int N, int gpuIdx) {
+  float *in = input->gbuf[gpuIdx];
+  float *out = output->gbuf[gpuIdx];
   int num = input->num_elem() / BATCH;
 
   dim3 block(1, 1);
@@ -518,6 +553,7 @@ void initialize_classifier(float *parameter, int N) {
     a_linear3 = new Tensor({BATCH, 1, 4});
 
     //yelim
+    a_input = new Tensor({BATCH, 1, VOCAB_SIZE, MAX_LENGTH});
     a_output = new Tensor({BATCH, 1});
   }
 }
