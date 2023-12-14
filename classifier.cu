@@ -5,7 +5,7 @@
 #include "classifier.h"
 #include "util.h"
 
-// static int mpi_rank;
+static int mpi_rank;
 
 #define CHECK_CUDA(call)                                              \
   do {                                                                \
@@ -20,7 +20,7 @@
 #define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
 #define BATCH 4
 #define TSIZE 4
-#define RSIZE 256
+#define RSIZE 16
 
 // Multi-dimensional matrix containing fp32 elements
 struct Tensor {
@@ -46,7 +46,6 @@ Tensor::Tensor(std::vector<int> shape_) {
   int N_ = num_elem();
   //reshape fin
 
-  // buf = (float *) calloc(N_, sizeof(float));
   CHECK_CUDA(cudaMallocHost(&buf, N_ * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&gbuf, N_ * sizeof(float)));
 }
@@ -58,10 +57,9 @@ Tensor::Tensor(std::vector<int> shape_, float *buf_) {
   int N_ = num_elem();
   // reshape fin
 
-  // buf = (float *) calloc(N_, sizeof(float));
   CHECK_CUDA(cudaMallocHost(&buf, N_ * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&gbuf, N_ * sizeof(float)));
-  memcpy(buf, buf_, N_ * sizeof(float)); // for (int n = 0; n < N_; ++n) { buf[n] = buf_[n]; }
+  memcpy(buf, buf_, N_ * sizeof(float));
   CHECK_CUDA(cudaMemcpy(gbuf, buf_, N_ * sizeof(float), cudaMemcpyHostToDevice));
 }
 
@@ -74,9 +72,8 @@ void Tensor::toGPU(){
 }
 
 Tensor::~Tensor() {
-  // if (buf != nullptr) free(buf);
-  cudaFreeHost(buf);
-  CHECK_CUDA(cudaFree(gbuf));
+  if (buf != nullptr) CHECK_CUDA(cudaFreeHost(buf));
+  if (gbuf != nullptr) CHECK_CUDA(cudaFree(gbuf));
 }
 
 int Tensor::num_elem() {
@@ -123,33 +120,12 @@ void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output);
 //me
 void find_maxIdx(Tensor *input, Tensor *output, int idx, int N);
 
-void why0(Tensor *t){
-  t->toCPU();
-  bool ok = true;
-  int count = 0;
-  for(int i = 0; i < t->num_elem(); i++){
-    printf(" %f", t->buf[i]);
-    if(t->buf[i] == 0.0f){
-      count++;
-    }else{
-      count = 0;
-    }
-    if(count == 100){
-      ok = false;
-      printf("here!!!!!!!! %d\n", i);
-      break;
-    }
-  }
-  if(ok) printf("\n*****successful %d******\n", t->num_elem());
-}
-
 // Only the first process (root, mpi_rank == 0) has the input and output
 // Parallelization method is totally up to you, but you should gather 
 // the output at rank 0
 void classifier(float *input_, float *output_, int N) {
-  // if (mpi_rank == 0) {
-    int loop = (BATCH + N - 1) / BATCH;
-    for (int idx = 0; idx < loop; ++idx) {  // N input sentences
+  if (mpi_rank == 0) {
+    for (int idx = 0; idx < CEIL_DIV(N, BATCH); ++idx) {  // N input sentences
 
       // Load one input sentence from input
       Tensor *one_input = new Tensor({BATCH, 1, VOCAB_SIZE, MAX_LENGTH}, input_ + idx * BATCH * VOCAB_SIZE * MAX_LENGTH);
@@ -197,14 +173,13 @@ void classifier(float *input_, float *output_, int N) {
 
       // FC block 3 : Linear
       vector_sum(a_relu8, w_fc3, b_fc3, a_linear3, true);
-      // why0(a_linear3);
+
       find_maxIdx(a_linear3, a_output, idx, N);
 
       CHECK_CUDA(cudaMemcpy(output_ + BATCH * idx, a_output->gbuf, BATCH * sizeof(float), cudaMemcpyDeviceToHost));
       CHECK_CUDA(cudaDeviceSynchronize());
     }
-    //}  // end N input sentences loop
-  // }    // if mpi_rank == 0
+  }    // if mpi_rank == 0
 }
 
 __global__ void conv1d_kernel(float *in, float *out, float *weight, float *bias, int out_channels, int in_channels, int kernel_size, int input_length, int output_length, bool has_bias){
@@ -493,8 +468,8 @@ void find_maxIdx(Tensor *input, Tensor *output, int idx, int N) {
 // Only the first process (root, mpi_rank == 0) has the parameter
 // You must broadcast it to the others
 void initialize_classifier(float *parameter, int N) {
-  // MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-  // if (mpi_rank == 0) {
+  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+  if (mpi_rank == 0) {
     w_conv1 = new Tensor({256, 70, 7}, parameter + OFFSET0);
     b_conv1 = new Tensor({256}, parameter + OFFSET1);
     gamma_conv1 = new Tensor({256, 1008}, parameter + OFFSET2);
@@ -544,12 +519,12 @@ void initialize_classifier(float *parameter, int N) {
 
     //yelim
     a_output = new Tensor({BATCH, 1});
-  // }
+  }
 }
 
 // Free all dynamically allocated variables
 void finalize_classifier() {
-  // if (mpi_rank == 0) {
+  if (mpi_rank == 0) {
     delete w_conv1;
     delete b_conv1;
     delete w_conv2;
@@ -597,5 +572,5 @@ void finalize_classifier() {
     delete a_linear3;
     //yelim
     delete a_output;
-  // }
+  }
 }
